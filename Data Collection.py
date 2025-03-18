@@ -1,71 +1,139 @@
+import tkinter as tk
+from tkinter import simpledialog, messagebox
 import cv2
 import dlib
 import numpy as np
-import os
-from keras_vggface import VGGFace
-from keras_vggface.utils import preprocess_input
-from keras.preprocessing import image
 import mysql.connector
+from keras_vggface.vggface import VGGFace
+from keras_vggface.utils import preprocess_input
 
-# Load face detector and shape predictor
+# Load pre-trained models
+facenet_model = VGGFace(model='resnet50', include_top=False, input_shape=(224, 224, 3), pooling='avg')
 detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('Desktop/FYP/facial-landmarks-recognition-master/shape_predictor_68_face_landmarks.dat')
+predictor = dlib.shape_predictor("path/to/shape_predictor_68_face_landmarks.dat")  # Correct path here
 
-# Load VGGFace model
-model = VGGFace(model='resnet50')
+# Connect to MySQL database
+db = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    password="your_password",  # Change to your MySQL password
+    database="face_recognition_system"
+)
+cursor = db.cursor()
 
-# Connect to MySQL Database
-def connect_db():
-    connection = mysql.connector.connect(
-        host="localhost",
-        user="your_username",
-        password="your_password",
-        database="FaceRecognitionDB"
-    )
-    return connection
+# Function to detect faces in an image
+def detect_faces(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = detector(gray)
+    return faces
 
-# Insert face embedding into database
-def insert_face_embedding(name, embedding):
-    connection = connect_db()
-    cursor = connection.cursor()
-    query = "INSERT INTO Faces (name, embedding) VALUES (%s, %s)"
-    cursor.execute(query, (name, embedding.tobytes()))
-    connection.commit()
-    cursor.close()
-    connection.close()
+# Function to recognize a face using VGGFace
+def recognize_face(face_image):
+    # Resize the face image to the required input size for VGGFace (224x224)
+    face_image = cv2.resize(face_image, (224, 224))
+    
+    # Convert the image to float32 and normalize pixel values to [0, 1]
+    face_image = face_image.astype('float32') / 255.0
+    
+    # Expand dimensions to match the input shape expected by VGGFace (batch size of 1)
+    face_image = np.expand_dims(face_image, axis=0)
+    
+    # Preprocess the image for VGGFace
+    face_image = preprocess_input(face_image, version=2)
+    
+    # Generate the face embedding using the VGGFace model
+    embedding = facenet_model.predict(face_image)
+    return embedding.flatten()  # Flatten the embedding to 1D array
 
-# Get the face embedding from the face image
-def get_face_embedding(face_image):
-    img = cv2.resize(face_image, (224, 224))
-    img = image.img_to_array(img)
-    img = np.expand_dims(img, axis=0)
-    img = preprocess_input(img)
+# Function to store new face embedding into the database
+def store_face_embedding(name, embedding):
+    # Convert embedding to a binary format for storage
+    embedding_blob = embedding.tobytes()
+    
+    # Insert the new face's name and embedding into the database
+    cursor.execute("INSERT INTO faces (name, embedding) VALUES (%s, %s)", (name, embedding_blob))
+    db.commit()
 
-    embedding = model.predict(img)
-    return embedding
+    messagebox.showinfo("Success", "Face data saved successfully!")
 
-# Function to collect faces from a folder and store embeddings
-def collect_faces_from_folder(folder_path):
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".jpg") or filename.endswith(".png"):
-            img_path = os.path.join(folder_path, filename)
-            img = cv2.imread(img_path)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            faces = detector(gray)
+# Data Collection Class
+class DataCollection:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Face Data Collection")
+        self.root.geometry("800x600")
 
-            for face in faces:
-                # Get the face ROI
-                x, y, w, h = (face.left(), face.top(), face.width(), face.height())
-                face_roi = img[y:y+h, x:x+w]
+        # Live Feed Panel
+        self.live_feed_label = tk.Label(root)
+        self.live_feed_label.pack()
 
-                # Get the face embedding
-                embedding = get_face_embedding(face_roi)
+        # Control Buttons
+        self.start_button = tk.Button(root, text="Start Data Collection", command=self.start_data_collection)
+        self.start_button.pack(side=tk.LEFT, padx=10)
 
-                # Insert embedding into database
-                name = filename.split('.')[0]
-                insert_face_embedding(name, embedding)
+        self.quit_button = tk.Button(root, text="Quit", command=self.root.quit)
+        self.quit_button.pack(side=tk.LEFT, padx=10)
 
-            print(f"Processed {filename}")
+        # Start webcam feed
+        self.cap = cv2.VideoCapture(0)
+        self.update_frame()
 
-# Collect faces from the dataset
-collect_faces_from_folder("Desktop/FYP/Datasets/img_align_celeba")
+    def start_data_collection(self):
+        # Prompt user for name
+        name = simpledialog.askstring("Input", "Enter the name of the person:")
+        if name is None or name == "":
+            messagebox.showwarning("Input Error", "Name cannot be empty!")
+            return
+
+        messagebox.showinfo("Instruction", "Please position the face within the camera frame for collection.")
+
+        # Capture face for registration
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+
+            # Detect faces in the frame
+            faces = detect_faces(frame)
+
+            # If exactly one face is detected, process it
+            if len(faces) == 1:
+                for face in faces:
+                    x, y, w, h = face.left(), face.top(), face.width(), face.height()
+                    face_image = frame[y:y+h, x:x+w]
+
+                    # Recognize the face and extract the embedding
+                    embedding = recognize_face(face_image)
+
+                    # Store the embedding in the database
+                    store_face_embedding(name, embedding)
+
+                    # Draw a rectangle around the detected face
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+
+                    # Update the live feed display
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = ImageTk.PhotoImage(Image.fromarray(frame))
+                    self.live_feed_label.config(image=img)
+                    self.live_feed_label.image = img
+                break
+
+            # Display the frame with face detection
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = ImageTk.PhotoImage(Image.fromarray(frame))
+            self.live_feed_label.config(image=img)
+            self.live_feed_label.image = img
+
+    def update_frame(self):
+        ret, frame = self.cap.read()
+        if ret:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = ImageTk.PhotoImage(Image.fromarray(frame))
+            self.live_feed_label.config(image=img)
+            self.live_feed_label.image = img
+        self.root.after(10, self.update_frame)
+
+# Create the Tkinter window
+root = tk.Tk()
+app = DataCollection(root)
+root.mainloop()
